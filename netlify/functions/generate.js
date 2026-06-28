@@ -1,6 +1,4 @@
-const { getStore } = require("@netlify/blobs");
-
-exports.handler = async (event, context) => {
+exports.handler = async (event) => {
   if (event.httpMethod !== "POST") {
     return { statusCode: 405, body: "Method Not Allowed" };
   }
@@ -26,50 +24,60 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // Upload media to Netlify Blobs and get public URLs
-    const store = getStore({
-      name: "smobflow-media",
-      siteID: context.site?.id || process.env.SITE_ID,
-      token: process.env.NETLIFY_BLOBS_TOKEN || context.clientContext?.identity?.token,
-    });
+    // Build BytePlus content array — text first
+    const content = [{ type: "text", text: prompt }];
 
-    const mediaUrls = [];
-
+    // Upload media to tmpfiles.org to get public URLs
     if (mediaItems && mediaItems.length > 0) {
       for (const item of mediaItems) {
         if (!item.dataUrl) continue;
 
-        // Convert base64 to buffer
-        const base64Data = item.dataUrl.split(",")[1];
-        const buffer = Buffer.from(base64Data, "base64");
-        const ext = item.type === "video" ? "mp4" : "jpg";
-        const key = `upload-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+        try {
+          // Convert base64 to binary
+          const base64Data = item.dataUrl.split(",")[1];
+          const mimeType = item.mimeType || (item.type === "video" ? "video/mp4" : "image/jpeg");
+          const ext = item.type === "video" ? "mp4" : "jpg";
 
-        await store.set(key, buffer, {
-          metadata: { type: item.mimeType || (item.type === "video" ? "video/mp4" : "image/jpeg") },
-        });
+          // Upload to tmpfiles.org (free, no auth needed, 24h expiry)
+          const formData = `--boundary\r\nContent-Disposition: form-data; name="file"; filename="upload.${ext}"\r\nContent-Type: ${mimeType}\r\nContent-Transfer-Encoding: base64\r\n\r\n${base64Data}\r\n--boundary--`;
 
-        const url = `https://${process.env.URL || event.headers.host}/.netlify/blobs/smobflow-media/${key}`;
-        mediaUrls.push({ type: item.type, url });
-      }
-    }
+          const uploadRes = await fetch("https://tmpfiles.org/api/v1/upload", {
+            method: "POST",
+            headers: {
+              "Content-Type": "multipart/form-data; boundary=boundary",
+            },
+            body: formData,
+          });
 
-    // Build BytePlus content array
-    const content = [{ type: "text", text: prompt }];
+          if (uploadRes.ok) {
+            const uploadData = await uploadRes.json();
+            // tmpfiles.org returns url like https://tmpfiles.org/1234/file.jpg
+            // Direct download URL is https://tmpfiles.org/dl/1234/file.jpg
+            const publicUrl = uploadData?.data?.url?.replace(
+              "tmpfiles.org/",
+              "tmpfiles.org/dl/"
+            );
 
-    for (const media of mediaUrls) {
-      if (media.type === "image") {
-        content.push({
-          type: "image_url",
-          image_url: { url: media.url },
-          role: "reference_image",
-        });
-      } else if (media.type === "video") {
-        content.push({
-          type: "video_url",
-          video_url: { url: media.url },
-          role: "reference_video",
-        });
+            if (publicUrl) {
+              if (item.type === "image") {
+                content.push({
+                  type: "image_url",
+                  image_url: { url: publicUrl },
+                  role: "reference_image",
+                });
+              } else if (item.type === "video") {
+                content.push({
+                  type: "video_url",
+                  video_url: { url: publicUrl },
+                  role: "reference_video",
+                });
+              }
+            }
+          }
+        } catch (uploadErr) {
+          console.error("Upload error:", uploadErr.message);
+          // Continue without this media item
+        }
       }
     }
 
@@ -82,7 +90,7 @@ exports.handler = async (event, context) => {
       watermark: false,
     };
 
-    // Submit task
+    // Submit task to BytePlus
     const submitRes = await fetch(ENDPOINT, {
       method: "POST",
       headers: {
@@ -113,7 +121,7 @@ exports.handler = async (event, context) => {
       };
     }
 
-    // Poll for result
+    // Poll for result — max 3 minutes
     const pollUrl = `${ENDPOINT}/${taskId}`;
     let videoUrl = null;
 
